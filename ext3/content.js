@@ -12,11 +12,70 @@ const SELECT_POPUP_ID = "exten-select-popup";
 const STORAGE_LOG_KEY = "suggestionsLog";
 const STORAGE_IGNORED_KEY = "extenIgnored"; // [{ original, suggestion }]
 
+const SPINNER_ID = "exten-loading-spinner";
+const SPINNER_STYLE_ID = "exten-loading-style";
+
 // Глобальные кэши и флаги
 window.__extenLastSuggestions = Array.isArray(window.__extenLastSuggestions) ? window.__extenLastSuggestions : [];
 window.__extenIgnoredSet = window.__extenIgnoredSet instanceof Set ? window.__extenIgnoredSet : new Set();
 let __selectPopupActive = false;
-let __pointerInSelectPopup = false; // NEW: курсор внутри окна выбора?
+let __pointerInSelectPopup = false; // курсор внутри окна выбора?
+let __pendingRequests = 0; // для спиннера
+
+////////////////////////////////////////////////////////////////////////////////
+// 0) Индикатор загрузки (спиннер, верхний левый угол)
+////////////////////////////////////////////////////////////////////////////////
+function ensureSpinnerStyle() {
+  if (document.getElementById(SPINNER_STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = SPINNER_STYLE_ID;
+  style.textContent = `
+    @keyframes exten-spin { to { transform: rotate(360deg); } }
+  `;
+  document.head.appendChild(style);
+}
+function ensureSpinner() {
+  let s = document.getElementById(SPINNER_ID);
+  if (!s) {
+    ensureSpinnerStyle();
+    s = document.createElement("div");
+    s.id = SPINNER_ID;
+    Object.assign(s.style, {
+      position: "fixed",
+      top: "8px",
+      left: "8px",
+      width: "18px",
+      height: "18px",
+      border: "2px solid rgba(0,0,0,0.25)",
+      borderTopColor: "rgba(0,0,0,0.85)",
+      borderRadius: "50%",
+      animation: "exten-spin 0.9s linear infinite",
+      zIndex: "2147483647",
+      pointerEvents: "none",
+      display: "none",
+      backdropFilter: "blur(0px)"
+    });
+    // темная тема поддержка — если фон тёмный, границы видны всё равно
+    document.documentElement.appendChild(s);
+  }
+  return s;
+}
+function showSpinner() {
+  const s = ensureSpinner();
+  s.style.display = "block";
+}
+function hideSpinner() {
+  const s = document.getElementById(SPINNER_ID);
+  if (s) s.style.display = "none";
+}
+function incPending() {
+  __pendingRequests++;
+  if (__pendingRequests > 0) showSpinner();
+}
+function decPending() {
+  __pendingRequests = Math.max(0, __pendingRequests - 1);
+  if (__pendingRequests === 0) hideSpinner();
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // 5) Сохранение предложений в chrome.storage.local
@@ -151,7 +210,7 @@ function findSentenceMatchesInNode(textNode, original) {
   return matches;
 }
 
-// NEW: утилита закрыть все попапы, кроме указанного id
+// Закрыть все попапы, кроме указанного id
 function closeAllPopupsExcept(exceptId) {
   if (exceptId !== TOOLTIP_ID) hideTooltip();
   if (exceptId !== SELECT_POPUP_ID) hideSelectPopup();
@@ -255,7 +314,7 @@ function renderSuggestionsUI(suggestions) {
             cursor: "pointer",
             pointerEvents: "auto"
           });
-          // ВАЖНО: если курсор внутри окна выбора — не открываем тултип
+          // если курсор внутри окна выбора — не открываем тултип
           spot.addEventListener("mouseenter", () => {
             if (__pointerInSelectPopup) return;
             showTooltipNearRect(
@@ -336,6 +395,7 @@ function underlineOriginals(originals) {
 ////////////////////////////////////////////////////////////////////////////////
 async function processText(text) {
   if (!text) return;
+  incPending();
   try {
     const resp = await fetch(SERVER_URL, {
       method: "POST",
@@ -349,6 +409,8 @@ async function processText(text) {
     renderSuggestionsUI(suggestions);
   } catch (err) {
     console.error("[exten] Failed to contact server or process response:", err);
+  } finally {
+    decPending();
   }
 }
 
@@ -358,7 +420,7 @@ async function processText(text) {
 function isBlockish(el) {
   if (!(el instanceof Element)) return false;
   const tag = el.tagName.toLowerCase();
-  if (["p","div","section","article","main","aside","header","footer",
+  if (["div","section","article","main","aside","header","footer",
        "li","ul","ol","td","th","tr","table","figcaption","figure",
        "pre","blockquote"].includes(tag)) return true;
   const cs = getComputedStyle(el);
@@ -467,7 +529,7 @@ function ensureSelectPopup() {
     `;
     // Клики внутри попапа не считаем внешними
     p.addEventListener("click", (e) => e.stopPropagation());
-    // NEW: трекаем курсор внутри/снаружи попапа
+    // Трек курсора внутри/снаружи попапа (для блокировки тултипа)
     p.addEventListener("mouseenter", () => { __pointerInSelectPopup = true; });
     p.addEventListener("mouseleave", () => { __pointerInSelectPopup = false; });
     document.documentElement.appendChild(p);
@@ -580,7 +642,7 @@ function handleSelectionUI() {
 
   document.addEventListener("keydown", maybeSendOnPunctuation, true);
 
-  // Важно: не закрывать попап при вводе в его textarea или когда курсор над ним
+  // Не закрывать попап при вводе в его textarea / когда курсор над ним
   document.addEventListener("selectionchange", handleSelectionUI, true);
   document.addEventListener("mouseup", handleSelectionUI, true);
   document.addEventListener("keyup", handleSelectionUI, true);
