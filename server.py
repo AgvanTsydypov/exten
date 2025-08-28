@@ -29,6 +29,7 @@ suggested_text: List[str] = [
     "Suggested text",
 ]
 
+global_context = ""
 
 # --------------------- ЛОГИКА ИЗ ПЕРВОГО СКРИПТА ---------------------
 
@@ -54,7 +55,7 @@ def _pick_tail_block(full_text: str) -> str:
     return text
 
 
-def _build_prompt(block_text: str, context: str = "") -> str:
+def _build_prompt(block_text: str, context: str = global_context) -> str:
     return f"""
 Improve the following text.
 The improved version should be concise, clear, and impactful while preserving all the necessary information contained in the original.
@@ -220,7 +221,7 @@ def add_cors_headers(resp):
 
 
 @app.route("/main", methods=["POST", "OPTIONS"])
-def highlight():
+def main_text_proccessing():
     if request.method == "OPTIONS":
         return ("", 204)
 
@@ -249,6 +250,30 @@ def highlight():
 
     except Exception as e:
         print(f"DeepSeek error: {e}", file=sys.stderr)
+        return jsonify(ok=False, error=str(e)), 500
+    
+@app.route("/global_context", methods=["POST", "OPTIONS"])
+def context_proccessing():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    context = (data.get("context") or "").strip()  # опционально: дополнительный контекст
+
+    if not context:
+        return jsonify(ok=False, error="No 'context' provided"), 400
+
+    print(f"\n=== RECEIVED CONTEXT ===\n {len(context)} chars\n==========================\n")
+
+    try:
+        global_context = context
+
+        print(global_context)
+
+        return jsonify(ok=True, global_context=global_context, model=DEFAULT_MODEL)
+
+    except Exception as e:
+        print(f"Context error: {e}", file=sys.stderr)
         return jsonify(ok=False, error=str(e)), 500
 
 

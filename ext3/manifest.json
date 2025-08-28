@@ -2,8 +2,14 @@
   "manifest_version": 3,
   "name": "exten",
   "version": "1.0.0",
-  "permissions": ["storage"],
+
+  "permissions": ["storage", "tabs", "activeTab"],
   "host_permissions": ["http://127.0.0.1:5055/*"],
+
+  "background": { "service_worker": "background.js" },
+
+  "action": { "default_title": "Open global context" },
+
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
