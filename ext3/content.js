@@ -1,61 +1,45 @@
-(() => {
-  function getBlockText(target) {
-    // If user selected text, prefer that.
-    const sel = window.getSelection && window.getSelection();
-    if (sel && sel.toString().trim()) {
-      return sel.toString().trim();
-    }
+// Find the nearest "HTML block" for the clicked node and return its text.
+const BLOCK_SELECTOR = [
+  "p","li","blockquote","pre","code","article","section","main","aside",
+  "header","footer","dd","dt","figcaption","td","th",
+  "h1","h2","h3","h4","h5","h6","div"
+].join(",");
 
-    // Otherwise, find the nearest block-like ancestor and use its text.
-    let el = target;
-    while (el && el !== document.body) {
-      const display = getComputedStyle(el).display;
-      if (["block", "flex", "grid", "table", "list-item"].includes(display)) break;
-      el = el.parentElement;
-    }
-    if (!el) el = target;
+function getNearestBlockText(node) {
+  const el = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  const block = el?.closest?.(BLOCK_SELECTOR) || el;
+  if (!block) return "";
+  // innerText keeps visual text (ignores hidden)
+  return (block.innerText || block.textContent || "").replace(/\s+/g, " ").trim();
+}
 
-    return (el.innerText || el.textContent || "").trim();
+// Capture early (mousedown) so selection/caret changes don't wipe the text.
+document.addEventListener("mousedown", (e) => {
+  if (!e.altKey) return;
+
+  const text = getNearestBlockText(e.target);
+  if (!text) {
+    console.log("[exten] No block text under cursor.");
+    return;
   }
 
-  function toast(ok) {
-    try {
-      const t = document.createElement("div");
-      t.textContent = ok ? "✓ Sent" : "✗ Failed";
-      Object.assign(t.style, {
-        position: "fixed",
-        right: "12px",
-        bottom: "12px",
-        zIndex: 2147483647,
-        padding: "8px 10px",
-        background: ok ? "#0b8" : "#c33",
-        color: "white",
-        fontSize: "12px",
-        borderRadius: "6px",
-        boxShadow: "0 2px 8px rgba(0,0,0,.15)",
-        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
-      });
-      document.body.appendChild(t);
-      setTimeout(() => t.remove(), 1200);
-    } catch (_) {}
+  // Keep it reasonable; servers often dislike megabyte payloads.
+  const payload = text.length > 8000 ? text.slice(0, 8000) : text;
+
+  // Send to background to talk to the server.
+  chrome.runtime.sendMessage({ type: "SEND_TO_SERVER", text: payload });
+}, { capture: true });
+
+// Receive server response and log `suggestment` into page console.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === "SERVER_RESPONSE") {
+    const data = msg.data;
+    if (data && typeof data === "object" && "suggestions" in data) {
+      console.log("[exten] suggestment:", data);
+    } else {
+      console.log("[exten] No \"suggestment\" in response:", data);
+    }
+  } else if (msg?.type === "SERVER_RESPONSE_ERROR") {
+    console.error("[exten] Server error:", msg.error);
   }
-
-  // ALT-click to send the clicked block's text.
-  document.addEventListener(
-    "click",
-    (e) => {
-      if (!e.altKey) return; // require Alt/Option
-      const text = getBlockText(e.target);
-      if (!text) return;
-
-      chrome.runtime.sendMessage(
-        { type: "SEND_TEXT", text, title: document.title },
-        (resp) => {
-          if (!resp) return;
-          toast(Boolean(resp.ok));
-        }
-      );
-    },
-    true // capture to catch early before site handlers possibly stop it
-  );
-})();
+});

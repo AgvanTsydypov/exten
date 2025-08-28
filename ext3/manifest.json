@@ -1,17 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "Mouse Text Sender",
+  "name": "exten",
   "version": "1.0.1",
-  "permissions": ["activeTab"],
-  "host_permissions": [
-    "http://127.0.0.1:5055/*",
-    "http://localhost:5055/*"
-  ],
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
   "background": { "service_worker": "background.js" },
-  "content_scripts": [{
-    "matches": ["<all_urls>"],
-    "js": ["content.js"],
-    "run_at": "document_start",
-    "all_frames": true
-  }]
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
 }
