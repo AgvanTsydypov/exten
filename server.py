@@ -34,7 +34,7 @@ suggested_text: List[str] = [
 
 SENTENCE_SPLIT_REGEX = r'(?<=[.?!])\s+'
 MAX_BLOCK_LEN = 2200
-IMPORTANCE_THRESHOLD = 7
+IMPORTANCE_THRESHOLD = 8
 
 
 def _pick_tail_block(full_text: str) -> str:
@@ -231,6 +231,8 @@ def highlight():
 
     if not text:
         return jsonify(ok=False, error="No 'text' provided"), 400
+    
+    print(text)
 
     print(f"\n=== RECEIVED MAIN ===\nFrom: {url}\nLen: {len(text)} chars\n==========================\n")
 
