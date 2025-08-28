@@ -8,12 +8,15 @@
 const SERVER_URL = "http://127.0.0.1:5055/main";
 const OVERLAY_ID = "exten-underline-overlay";
 const TOOLTIP_ID = "exten-suggest-tooltip";
+const SELECT_POPUP_ID = "exten-select-popup";
 const STORAGE_LOG_KEY = "suggestionsLog";
 const STORAGE_IGNORED_KEY = "extenIgnored"; // [{ original, suggestion }]
 
-// Глобальные кэши
+// Глобальные кэши и флаги
 window.__extenLastSuggestions = Array.isArray(window.__extenLastSuggestions) ? window.__extenLastSuggestions : [];
 window.__extenIgnoredSet = window.__extenIgnoredSet instanceof Set ? window.__extenIgnoredSet : new Set();
+let __selectPopupActive = false;
+let __pointerInSelectPopup = false; // NEW: курсор внутри окна выбора?
 
 ////////////////////////////////////////////////////////////////////////////////
 // 5) Сохранение предложений в chrome.storage.local
@@ -24,7 +27,6 @@ async function saveSuggestions({ url, sourceText, suggestions }) {
     const suggestionsLog = Array.isArray(got[STORAGE_LOG_KEY]) ? got[STORAGE_LOG_KEY] : [];
     suggestionsLog.push({ url, sourceText, suggestions, ts: Date.now() });
     await chrome.storage.local.set({ [STORAGE_LOG_KEY]: suggestionsLog });
-    // Удобно держать последнюю выдачу для перерисовки
     window.__extenLastSuggestions = suggestions;
   } catch (e) {
     console.warn("[exten] Failed to save suggestions:", e);
@@ -37,18 +39,15 @@ async function saveSuggestions({ url, sourceText, suggestions }) {
 function makeIgnoreKey(original, suggestion) {
   return String(original ?? "") + "\u0001" + String(suggestion ?? "");
 }
-
 async function loadIgnoredSet() {
   try {
     const got = await chrome.storage.local.get(STORAGE_IGNORED_KEY);
     const arr = Array.isArray(got[STORAGE_IGNORED_KEY]) ? got[STORAGE_IGNORED_KEY] : [];
     window.__extenIgnoredSet = new Set(arr.map(x => makeIgnoreKey(x.original, x.suggestion)));
-  } catch (e) {
-    console.warn("[exten] Failed to load ignored suggestions:", e);
+  } catch {
     window.__extenIgnoredSet = new Set();
   }
 }
-
 async function addToIgnored(original, suggestion) {
   try {
     const key = makeIgnoreKey(original, suggestion);
@@ -75,19 +74,17 @@ function ensureOverlay() {
     Object.assign(overlay.style, {
       position: "fixed",
       inset: "0",
-      pointerEvents: "none", // клики ловят только вложенные хотспоты
+      pointerEvents: "none",
       zIndex: "2147483647"
     });
     document.documentElement.appendChild(overlay);
   }
   return overlay;
 }
-
 function clearOverlay() {
   const overlay = document.getElementById(OVERLAY_ID);
   if (overlay) overlay.innerHTML = "";
 }
-
 function drawUnderlineForRect(rect) {
   const line = document.createElement("div");
   const thickness = 2;
@@ -97,26 +94,20 @@ function drawUnderlineForRect(rect) {
     top: rect.top + rect.height - thickness + "px",
     width: rect.width + "px",
     height: thickness + "px",
-    background: "rgba(255, 215, 0, 0.9)", // золотистая линия
+    background: "rgba(255, 215, 0, 0.9)",
     borderRadius: "1px",
     boxShadow: "0 0 0.5px rgba(0,0,0,0.4)",
     pointerEvents: "none"
   });
   return line;
 }
-
 function getVisibleClientRectsForRange(range) {
   const rects = Array.from(range.getClientRects());
   const vw = window.innerWidth, vh = window.innerHeight;
   return rects.filter(r =>
-    r.width > 0.5 &&
-    r.height > 0.5 &&
-    r.left < vw && r.top < vh &&
-    r.bottom > 0 && r.right > 0
+    r.width > 0.5 && r.height > 0.5 && r.left < vw && r.top < vh && r.bottom > 0 && r.right > 0
   );
 }
-
-// Перебор текстовых узлов страницы (без скриптов/стилей/скрытого)
 function* textNodesUnder(root) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(n) {
@@ -136,30 +127,19 @@ function* textNodesUnder(root) {
 ////////////////////////////////////////////////////////////////////////////////
 // 6+7) Поиск совпадений, подсветка, тултип, замена и "cancel"
 ////////////////////////////////////////////////////////////////////////////////
-
 let __extenMatches = []; // [{ range, original, suggestion, rects }]
-
-function isBoundaryLeft(ch) {
-  return !ch || /\s|[([{"'“‘«—–-]|[.!?]/.test(ch);
-}
-function isBoundaryRight(ch) {
-  return !ch || /\s|[)\]},"'”’»—–-]|[.!?]/.test(ch);
-}
-
-// Ищем точные вхождения original внутри одного текстового узла с границами "предложения"
+function isBoundaryLeft(ch) { return !ch || /\s|[([{"'“‘«—–-]|[.!?]/.test(ch); }
+function isBoundaryRight(ch){ return !ch || /\s|[)\]},"'”’»—–-]|[.!?]/.test(ch); }
 function findSentenceMatchesInNode(textNode, original) {
   const text = textNode.nodeValue;
   if (!text || !original) return [];
-
   const matches = [];
   let from = 0;
   while (true) {
     const idx = text.indexOf(original, from);
     if (idx === -1) break;
-
     const prev = idx > 0 ? text[idx - 1] : "";
     const next = (idx + original.length < text.length) ? text[idx + original.length] : "";
-
     if (isBoundaryLeft(prev) && isBoundaryRight(next)) {
       const r = document.createRange();
       r.setStart(textNode, idx);
@@ -169,6 +149,12 @@ function findSentenceMatchesInNode(textNode, original) {
     from = idx + original.length;
   }
   return matches;
+}
+
+// NEW: утилита закрыть все попапы, кроме указанного id
+function closeAllPopupsExcept(exceptId) {
+  if (exceptId !== TOOLTIP_ID) hideTooltip();
+  if (exceptId !== SELECT_POPUP_ID) hideSelectPopup();
 }
 
 function ensureTooltip() {
@@ -202,15 +188,15 @@ function ensureTooltip() {
   }
   return t;
 }
-
 function showTooltipNearRect(rect, suggestion, onReplace, onIgnore) {
+  // при открытии тултипа — закрыть другие попапы (включая select)
+  closeAllPopupsExcept(TOOLTIP_ID);
+
   const tip = ensureTooltip();
-  // Содержимое
   tip.querySelector("#exten-tip-text").textContent = suggestion || "(no suggestion)";
-  // Позиционирование
   tip.style.display = "block";
   tip.style.left = "0px";
-  tip.style.top = "-10000px"; // предварительно за пределами экрана
+  tip.style.top = "-10000px";
   const pad = 8;
   const width = tip.offsetWidth, height = tip.offsetHeight;
   let left = Math.min(Math.max(rect.left, 8), window.innerWidth - width - 8);
@@ -219,37 +205,27 @@ function showTooltipNearRect(rect, suggestion, onReplace, onIgnore) {
   tip.style.left = `${left}px`;
   tip.style.top = `${top}px`;
 
-  // Обработчики
   const btnReplace = tip.querySelector("#exten-tip-replace");
   const btnClose = tip.querySelector("#exten-tip-close");
   const btnIgnore = tip.querySelector("#exten-tip-ignore");
-
   btnReplace.onclick = (e) => { e.stopPropagation(); onReplace(); hideTooltip(); };
   btnClose.onclick = (e) => { e.stopPropagation(); hideTooltip(); };
   btnIgnore.onclick = (e) => { e.stopPropagation(); onIgnore(); hideTooltip(); };
 }
-
 function hideTooltip() {
   const tip = document.getElementById(TOOLTIP_ID);
   if (tip) tip.style.display = "none";
 }
 
-// Отрисовка всех подсказок: подчёркивания + хотспоты + hover/replace/ignore
 function renderSuggestionsUI(suggestions) {
   clearOverlay();
   const overlay = ensureOverlay();
   __extenMatches = [];
-
-  // Фильтрация игнорированных
   const ignored = window.__extenIgnoredSet || new Set();
   const items = (Array.isArray(suggestions) ? suggestions : [])
     .filter(s => s && typeof s.original === "string")
     .filter(s => !ignored.has(makeIgnoreKey(s.original, s.suggestion || "")));
-
-  if (!items.length) {
-    hideTooltip();
-    return;
-  }
+  if (!items.length) { hideTooltip(); return; }
 
   for (const node of textNodesUnder(document.body)) {
     for (let i = 0; i < items.length; i++) {
@@ -265,10 +241,8 @@ function renderSuggestionsUI(suggestions) {
 
         const matchIndex = __extenMatches.push({ range, original, suggestion, rects }) - 1;
 
-        // Визуальная подчёркивающая линия
         for (const r of rects) overlay.appendChild(drawUnderlineForRect(r));
 
-        // Прозрачные интерактивные хотспоты
         for (const r of rects) {
           const spot = document.createElement("div");
           Object.assign(spot.style, {
@@ -281,7 +255,9 @@ function renderSuggestionsUI(suggestions) {
             cursor: "pointer",
             pointerEvents: "auto"
           });
+          // ВАЖНО: если курсор внутри окна выбора — не открываем тултип
           spot.addEventListener("mouseenter", () => {
+            if (__pointerInSelectPopup) return;
             showTooltipNearRect(
               r,
               suggestion,
@@ -290,6 +266,7 @@ function renderSuggestionsUI(suggestions) {
             );
           });
           spot.addEventListener("click", (e) => {
+            if (__pointerInSelectPopup) return;
             e.preventDefault(); e.stopPropagation();
             showTooltipNearRect(
               r,
@@ -313,7 +290,6 @@ function renderSuggestionsUI(suggestions) {
       renderSuggestionsUI(window.__extenLastSuggestions || []);
     });
   }
-  // Снимем предыдущие слушатели, если были
   if (window.__extenRerenderHandler) {
     window.removeEventListener("scroll", window.__extenRerenderHandler);
     window.removeEventListener("resize", window.__extenRerenderHandler);
@@ -322,14 +298,10 @@ function renderSuggestionsUI(suggestions) {
   window.addEventListener("scroll", scheduleRerender, { passive: true });
   window.addEventListener("resize", scheduleRerender);
 
-  // Наблюдатель за изменениями DOM
   if (window.__extenMo) window.__extenMo.disconnect();
-  window.__extenMo = new MutationObserver(() => {
-    scheduleRerender();
-  });
+  window.__extenMo = new MutationObserver(() => { scheduleRerender(); });
   window.__extenMo.observe(document.body, { childList: true, characterData: true, subtree: true });
 }
-
 function replaceMatch(index) {
   const m = __extenMatches[index];
   if (!m) return;
@@ -345,41 +317,53 @@ function replaceMatch(index) {
     renderSuggestionsUI(window.__extenLastSuggestions || []);
   }
 }
-
 function ignoreMatch(index) {
   const m = __extenMatches[index];
   if (!m) return;
   const { original, suggestion } = m;
   addToIgnored(original, suggestion).then(() => {
     hideTooltip();
-    // Перерисовать без игнорируемой пары
     renderSuggestionsUI(window.__extenLastSuggestions || []);
   });
 }
-
-// Для совместимости: если где-то вызывается старое underlineOriginals(originals)
 function underlineOriginals(originals) {
   const suggestions = (originals || []).map(o => ({ original: o, suggestion: "" }));
   renderSuggestionsUI(suggestions);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 1–4) Alt+Click: отправляем ВЕСЬ текст блока в сервер, логируем suggestment,
-//     сохраняем suggestions и запускаем подсветку/замену
+// Общая отправка текста
 ////////////////////////////////////////////////////////////////////////////////
+async function processText(text) {
+  if (!text) return;
+  try {
+    const resp = await fetch(SERVER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    });
+    const data = await resp.json();
+    console.log("suggestment:", data?.suggestment);
+    const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+    await saveSuggestions({ url: location.href, sourceText: text, suggestions });
+    renderSuggestionsUI(suggestions);
+  } catch (err) {
+    console.error("[exten] Failed to contact server or process response:", err);
+  }
+}
 
+////////////////////////////////////////////////////////////////////////////////
+// 1–4) Alt+Click: отправляем ВЕСЬ текст блока
+////////////////////////////////////////////////////////////////////////////////
 function isBlockish(el) {
   if (!(el instanceof Element)) return false;
   const tag = el.tagName.toLowerCase();
-  if ([
-    "p","div","section","article","main","aside","header","footer",
-    "li","ul","ol","td","th","tr","table","figcaption","figure",
-    "pre","blockquote"
-  ].includes(tag)) return true;
+  if (["p","div","section","article","main","aside","header","footer",
+       "li","ul","ol","td","th","tr","table","figcaption","figure",
+       "pre","blockquote"].includes(tag)) return true;
   const cs = getComputedStyle(el);
   return ["block","flex","grid","table","flow-root","list-item"].includes(cs.display);
 }
-
 function findBlockRoot(start) {
   if (!(start instanceof Element)) return document.body;
   const marked = start.closest("[data-exten-block]");
@@ -391,62 +375,24 @@ function findBlockRoot(start) {
   }
   return document.body;
 }
-
 function textFromBlock(el) {
   const txt = (el && el.innerText ? el.innerText : "").trim();
-  const MAX = 50000; // страховка от огромных блоков
+  const MAX = 50000;
   return txt.length > MAX ? txt.slice(0, MAX) : txt;
 }
-
-async function processText(text) {
-  if (!text) return;
-
-  try {
-    const resp = await fetch(SERVER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text })
-    });
-    const data = await resp.json();
-
-    // === старое поведение ===
-    const suggestment = data?.suggestment;
-    console.log("suggestment:", suggestment);
-
-    // === 5) сохраняем data.suggestions ===
-    const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
-    await saveSuggestions({
-      url: location.href,
-      sourceText: text,
-      suggestions
-    });
-
-    // === 6–7) подчёркивания + тултип + замена (+ фильтр игнор) ===
-    renderSuggestionsUI(suggestions);
-  } catch (err) {
-    console.error("[exten] Failed to contact server or process response:", err);
-  }
-}
-
-async function handleAltClickSendBlock(e) {
+function handleAltClickSendBlock(e) {
   if (!e.altKey) return;
-
   const block = findBlockRoot(e.target);
   const text = textFromBlock(block);
   if (!text) return;
-
-  // Блокируем стандартное поведение клика по ссылкам и пр.
   e.preventDefault();
   e.stopPropagation();
-
   processText(text);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// ДОПОЛНИТЕЛЬНО: Отправка текста при вводе '.', '?' или '!' в редактируемых
-// полях (input/textarea/contenteditable)
+// Отправка при вводе '.', '?' или '!' в редактируемых полях
 ////////////////////////////////////////////////////////////////////////////////
-
 function isEditableTarget(el) {
   if (!(el instanceof Element)) return false;
   if (el.closest('[contenteditable="true"]')) return true;
@@ -454,37 +400,28 @@ function isEditableTarget(el) {
   if (tag === "textarea") return true;
   if (tag === "input") {
     const type = (el.getAttribute("type") || "text").toLowerCase();
-    return ["text", "search", "url", "tel", "email", "password", "number"].includes(type);
+    return ["text","search","url","tel","email","password","number"].includes(type);
   }
   return false;
 }
-
 function getEditableText(el) {
   if (!(el instanceof Element)) return "";
   const tag = el.tagName?.toLowerCase();
-  if (tag === "textarea") return el.value || "";
-  if (tag === "input") return el.value || "";
+  if (tag === "textarea" || tag === "input") return el.value || "";
   const ce = el.closest('[contenteditable="true"]');
   if (ce) return textFromBlock(ce);
   return "";
 }
-
-// простой анти-спам: не чаще раза в 800мс на элемент
 const __extenLastSendMap = new WeakMap();
-
 function maybeSendOnPunctuation(e) {
   if (!isEditableTarget(e.target)) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-
   const key = e.key;
   if (key !== "." && key !== "?" && key !== "!") return;
-
   const target = e.target;
   const now = Date.now();
   const last = __extenLastSendMap.get(target) || 0;
-  if (now - last < 800) return; // cooldown
-
-  // Дадим браузеру применить ввод символа, затем читаем текст
+  if (now - last < 800) return;
   setTimeout(() => {
     const text = getEditableText(target).trim();
     if (text) {
@@ -495,24 +432,166 @@ function maybeSendOnPunctuation(e) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Всплывающее окно при ВЫДЕЛЕНИИ текста (с полем ввода и кнопкой "send text")
+////////////////////////////////////////////////////////////////////////////////
+function ensureSelectPopup() {
+  let p = document.getElementById(SELECT_POPUP_ID);
+  if (!p) {
+    p = document.createElement("div");
+    p.id = SELECT_POPUP_ID;
+    Object.assign(p.style, {
+      position: "fixed",
+      maxWidth: "420px",
+      minWidth: "260px",
+      padding: "10px",
+      background: "rgba(255,255,255,0.98)",
+      border: "1px solid rgba(0,0,0,0.15)",
+      borderRadius: "10px",
+      boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+      font: "12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif",
+      color: "#111",
+      display: "none",
+      zIndex: "2147483647",
+      pointerEvents: "auto"
+    });
+    p.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:6px;">
+        <div style="font-weight:600;">Send selected</div>
+        <button id="exten-select-close" title="close" style="padding:2px 6px; border-radius:6px; border:1px solid #ddd; background:#fff; cursor:pointer;">✕</button>
+      </div>
+      <div id="exten-select-preview" style="max-height:100px; overflow:auto; background:#fafafa; border:1px solid #eee; border-radius:6px; padding:6px; margin-bottom:6px; white-space:pre-wrap;"></div>
+      <textarea id="exten-select-input" rows="3" placeholder="optional text to add..." style="width:100%; resize:vertical; border:1px solid #ddd; border-radius:6px; padding:6px; outline:none; margin-bottom:8px;"></textarea>
+      <div style="display:flex; gap:8px; justify-content:flex-end;">
+        <button id="exten-select-send" style="padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#f5f5f5; cursor:pointer;">send text</button>
+      </div>
+    `;
+    // Клики внутри попапа не считаем внешними
+    p.addEventListener("click", (e) => e.stopPropagation());
+    // NEW: трекаем курсор внутри/снаружи попапа
+    p.addEventListener("mouseenter", () => { __pointerInSelectPopup = true; });
+    p.addEventListener("mouseleave", () => { __pointerInSelectPopup = false; });
+    document.documentElement.appendChild(p);
+  }
+  return p;
+}
+function getSelectionRect() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  if (range.collapsed) return null;
+  const rects = range.getClientRects();
+  if (rects.length) return rects[0];
+  const rect = range.getBoundingClientRect?.();
+  if (rect && rect.width && rect.height) return rect;
+  return null;
+}
+function getSelectedText() {
+  const sel = window.getSelection();
+  if (!sel) return "";
+  return String(sel.toString() || "").trim();
+}
+function focusInsideSelectPopup() {
+  const p = document.getElementById(SELECT_POPUP_ID);
+  return !!(p && document.activeElement && p.contains(document.activeElement));
+}
+function showSelectPopup() {
+  const selected = getSelectedText();
+  if (!selected) return hideSelectPopup();
+  const rect = getSelectionRect();
+  if (!rect) return hideSelectPopup();
+
+  // при открытии окна выбора — закрыть другие попапы (тултип)
+  closeAllPopupsExcept(SELECT_POPUP_ID);
+
+  const p = ensureSelectPopup();
+  p.style.display = "block";
+  p.style.left = "0px";
+  p.style.top = "-10000px";
+
+  const preview = p.querySelector("#exten-select-preview");
+  const input = p.querySelector("#exten-select-input");
+  const btnSend = p.querySelector("#exten-select-send");
+  const btnClose = p.querySelector("#exten-select-close");
+
+  preview.textContent = selected;
+  if (!__selectPopupActive) input.value = "";
+
+  const pad = 8;
+  const width = p.offsetWidth, height = p.offsetHeight;
+  let left = Math.min(Math.max(rect.left, 8), window.innerWidth - width - 8);
+  let top = rect.top - height - pad;
+  if (top < 0) top = rect.bottom + pad;
+  p.style.left = `${left}px`;
+  p.style.top = `${top}px`;
+
+  btnSend.onclick = (e) => {
+    e.stopPropagation();
+    const extra = (input.value || "").trim();
+    const combined = extra ? (selected + "\n" + extra) : selected;
+    hideSelectPopup();
+    processText(combined);
+  };
+  btnClose.onclick = (e) => { e.stopPropagation(); hideSelectPopup(); };
+
+  __selectPopupActive = true;
+}
+function hideSelectPopup() {
+  const p = document.getElementById(SELECT_POPUP_ID);
+  if (p) p.style.display = "none";
+  __selectPopupActive = false;
+  __pointerInSelectPopup = false; // сброс флага
+}
+function handleSelectionUI() {
+  if (window.__extenSelTimer) cancelAnimationFrame(window.__extenSelTimer);
+  window.__extenSelTimer = requestAnimationFrame(() => {
+    const text = getSelectedText();
+    // если фокус или курсор внутри попапа — не закрываем и не открываем другие
+    if ((focusInsideSelectPopup() || __pointerInSelectPopup) && __selectPopupActive) {
+      return;
+    }
+    if (text && text.length > 0) {
+      showSelectPopup();
+    } else {
+      hideSelectPopup();
+    }
+  });
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Подключаем обработчики один раз
 ////////////////////////////////////////////////////////////////////////////////
 (function attachOnce() {
   if (window.__extenAltClickAttached) return;
   window.__extenAltClickAttached = true;
 
-  // Загрузить игноры до первой отрисовки
   loadIgnoredSet();
 
-  // Alt+Click по блоку
   document.addEventListener("click", handleAltClickSendBlock, true);
 
-  // Всплывающее окно — скрывать при клике вне
   document.addEventListener("click", (e) => {
     const tip = document.getElementById(TOOLTIP_ID);
     if (tip && !tip.contains(e.target)) hideTooltip();
+
+    const selPopup = document.getElementById(SELECT_POPUP_ID);
+    if (selPopup && !selPopup.contains(e.target)) {
+      if (!window.getSelection || window.getSelection().isCollapsed) hideSelectPopup();
+    }
   });
 
-  // Отправка при вводе пунктуации в редактируемых полях
   document.addEventListener("keydown", maybeSendOnPunctuation, true);
+
+  // Важно: не закрывать попап при вводе в его textarea или когда курсор над ним
+  document.addEventListener("selectionchange", handleSelectionUI, true);
+  document.addEventListener("mouseup", handleSelectionUI, true);
+  document.addEventListener("keyup", handleSelectionUI, true);
+
+  // Репозиционирование попапа при скролле/resize, если выделение ещё есть и курсор не в попапе
+  function repositionSelectionPopup() {
+    if (!__selectPopupActive) return;
+    if (focusInsideSelectPopup() || __pointerInSelectPopup) return;
+    const txt = getSelectedText();
+    if (txt) showSelectPopup();
+  }
+  window.addEventListener("scroll", repositionSelectionPopup, { passive: true });
+  window.addEventListener("resize", repositionSelectionPopup);
 })();
