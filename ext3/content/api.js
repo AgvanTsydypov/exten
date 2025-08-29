@@ -62,6 +62,32 @@
         if (useGlobalSpinner) decPending();
       }
     }
+
+
+    async function highlightText(selected, context = "", opts = {}) {
+        const { useGlobalSpinner = true, onSuggestions } = opts;
+        if (!selected) return;
+        if (useGlobalSpinner) incPending();
+        try {
+          const params = new URLSearchParams();
+          params.set("selected_text", selected);
+          if (context) params.set("context", context);
+          const resp = await fetch(URLS.HIGHLIGHT + "?" + params.toString(), {
+            method: "GET"
+          });
+          const data = await resp.json();
+          const suggestion = data?.suggestion || "";
+          const suggestions = suggestion ? [{ original: selected, suggestion }] : [];
+          await Exten.storage.saveSuggestions({ url: location.href, sourceText: selected, suggestions });
+          Exten.overlay.renderSuggestionsUI(suggestions);
+          if (typeof onSuggestions === "function") onSuggestions(suggestions, data);
+        } catch (err) {
+          console.error("[exten] Failed to contact server or process response:", err);
+          if (typeof onSuggestions === "function") onSuggestions([], { error: String(err) });
+        } finally {
+          if (useGlobalSpinner) decPending();
+        }
+      }
   
     async function sendGlobalContext(context) {
       incPending();
@@ -81,6 +107,7 @@
       }
     }
   
-    Exten.api = { processText, sendGlobalContext, ensureSpinnerStyle };
+
+    Exten.api = { processText, sendGlobalContext, ensureSpinnerStyle, highlightText };
   })();
   

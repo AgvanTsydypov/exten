@@ -41,7 +41,8 @@
       SERVER_BASE,
       URLS: {
         MAIN: SERVER_BASE + "/main",
-        GLOBAL_CONTEXT: SERVER_BASE + "/global_context"
+        GLOBAL_CONTEXT: SERVER_BASE + "/global_context",
+        HIGHLIGHT: SERVER_BASE + "/highlight"
       },
       IDS,
       Z,

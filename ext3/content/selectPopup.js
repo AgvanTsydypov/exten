@@ -155,13 +155,13 @@
       btnSend.onclick = (e) => {
         e.stopPropagation();
         const extra = (input.value || "").trim();
-        const combined = extra ? (selected + "\n" + extra) : selected;
+
   
         localSpinner.style.display = "inline-block";
         btnSend.disabled = true;
         input.disabled = true;
   
-        Exten.api.processText(combined, {
+        Exten.api.highlightText(selected, extra, {
           useGlobalSpinner: false,
           onSuggestions: (suggs) => {
             localSpinner.style.display = "none";
