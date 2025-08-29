@@ -37,7 +37,11 @@ class Suggestion(TypedDict):
     suggestion: str
 
 
-def get_suggestions(text: str, context: str = global_context) -> List[Suggestion]:
+def get_suggestions(text: str, context: Optional[str] = None) -> List[Suggestion]:
+    # если контекст не передали или он пустой — берём глобальный
+    if not context:
+        context = global_context
+
     parts = [s for s in re.split(r'(?<=[.?!])\s+', text.strip()) if s]
     if not parts:
         return []
@@ -72,16 +76,19 @@ def get_suggestions(text: str, context: str = global_context) -> List[Suggestion
     TEXT: "{block}"
     """
 
-    system_instruction = f"You are an editing assistant. Follow these CUSTOM INSTRUCTIONS strictly: {context}"
+    print(prompt)
+
+    combined_config = {
+        "thinking_config": types.ThinkingConfig(thinking_budget=128),
+        "response_mime_type": "application/json",
+        "response_schema": list[Suggestion],
+    }
+
 
     response = client.models.generate_content(
         model=DEFAULT_MODEL,
         contents=prompt,
-        system_instruction=system_instruction,
-        config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=128),
-            response_mime_type="application/json",
-        ),
+        config=combined_config
     )
 
     return json.loads(response.text)
@@ -182,6 +189,9 @@ def main_text_proccessing():
     url = data.get("url") or ""
     context = (data.get("context") or "").strip()  # опционально: дополнительный контекст
 
+    body_context = (data.get("context") or "").strip()
+    ctx = global_context + "\n" + body_context  # <-- вот это важно
+
     if not text:
         return jsonify(ok=False, error="No 'text' provided"), 400
     
@@ -190,7 +200,7 @@ def main_text_proccessing():
     print(f"\n=== RECEIVED MAIN ===\nFrom: {url}\nLen: {len(text)} chars\n==========================\n")
 
     try:
-        suggestions = get_suggestions(text, context=context)
+        suggestions = get_suggestions(text, context=ctx)
 
         # Печать в консоль для отладки
         print("=== SUGGESTIONS ===")
@@ -218,6 +228,7 @@ def context_proccessing():
     print(f"\n=== RECEIVED CONTEXT ===\n {len(context)} chars\n==========================\n")
 
     try:
+        global global_context
         global_context = context
 
         print(global_context)
