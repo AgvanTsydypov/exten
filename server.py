@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import os, sys, json, re
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Tuple, Optional, TypedDict
 
 # Gemini (Google Gen AI SDK)
 from google import genai
@@ -31,183 +31,61 @@ suggested_text: List[str] = [
 
 global_context = ""
 
-# --------------------- ЛОГИКА ИЗ ПЕРВОГО СКРИПТА ---------------------
 
-SENTENCE_SPLIT_REGEX = r'(?<=[.?!])\s+'
-MAX_BLOCK_LEN = 2200
-IMPORTANCE_THRESHOLD = 8
+class Suggestion(TypedDict):
+    original: str
+    suggestion: str
 
 
-def _pick_tail_block(full_text: str) -> str:
-    """
-    Берем последнее предложение и добавляем предложения слева,
-    пока общий размер блока < MAX_BLOCK_LEN.
-    """
-    parts = [s for s in re.split(SENTENCE_SPLIT_REGEX, full_text.strip()) if s]
+def get_suggestions(text: str, context: str = global_context) -> List[Suggestion]:
+    parts = [s for s in re.split(r'(?<=[.?!])\s+', text.strip()) if s]
     if not parts:
-        return ""
-    text = parts[-1]
+        return []
+    block = parts[-1]
     for s in reversed(parts[:-1]):
-        if len(s) + 1 + len(text) < MAX_BLOCK_LEN:
-            text = f"{s} {text}"
+        if len(s) + 1 + len(block) < 2200:
+            block = f"{s} {block}"
         else:
             break
-    return text
 
+    prompt = f"""
+    [SYSTEM CONTEXT:
+    {context}
+    ]
 
-def _build_prompt(block_text: str, context: str = global_context) -> str:
-    return f"""
-Improve the following text.
-The improved version should be concise, clear, and impactful while preserving all the necessary information contained in the original.
+    In TEXT (given below), identify all sentences which contain CLEAR imperfections (e.g., grammar/spelling/punctuation/syntax errors, unfinished sentences, inconsistencies with the rest
+    of the text [content, tense, style, etc], awkward phrasings, unclear/imprecise phrases, clearly unnecessary wordiness, factual errors, clear inconsistency
+    with the SYSTEM CONTEXT, etc). For each such sentence, suggest an improvement which fixes/adresses the imperfection(s) without changing meaning 
+    (except in CLEAR cases of factual errors). If the sentence has no clear imperfections, skip it.
 
-{context}
+    Return your response as a JSON array two keys:
+    1. "original": The original sentence provided in the TEXT.
+    2. "suggestion": The suggested improved version of the sentence specific sentence.
 
-Additionally, for each suggested change, rate its importance out of 10. 1 to 4 indicates little to no improvement (e.g., a simple paraphrase);
-5 indicates minor improvement; and 6 to 10 indicates notable improvement.
+    RULES:
+        Normally, there is a one-to-one mapping: each original sentence gets one improved sentence.
+        If multiple original sentences are best replaced by a smaller set of sentences, include one JSON entry per original sentence. Each entry should have the same "suggestion" value (the entire replacement set).
+        If one original sentence is best expanded into multiple sentences, do the same: produce one entry per original sentence, all pointing to the entire replacement set.
+        Only merge or split sentences if it addresses the root imperfections.
+        Only change the meaning in CLEAR cases of factual errors.
 
-Return your response as a JSON array with three keys:
-1. "original": The original sentence provided in the block of text.
-2. "suggestion": The suggested improved version of the specific sentence.
-3. "importance": The importance rating of the suggested sentence out of 10.
-
-Rules:
-    Normally, there is a one-to-one mapping: each original sentence gets one improved sentence.
-    If multiple original sentences are best replaced by a smaller set of sentences, include one JSON entry per original sentence. Each entry should have the same "suggestion" value (the entire replacement set).
-    If one original sentence is best expanded into multiple sentences, do the same: produce one entry per original sentence, all pointing to the entire replacement set.
-    Only merge or split sentences when it improves clarity, conciseness, or impact.
-    Do not change meaning.
-
-Block of text: "{block_text}"
-Only return a valid JSON array. Do not include explanations or markdown fences.
-""".strip()
-
-
-# def _call_deepseek_for_json(prompt: str, model: str = DEFAULT_MODEL) -> str:
-#     """
-#     Вызывает DeepSeek и возвращает сырой текст ответа (ожидаем JSON-массив).
-#     """
-#     resp = client.chat.completions.create(
-#         model=model,
-#         messages=[
-#             {"role": "system", "content": "You are a helpful, precise editor. Return only valid JSON arrays."},
-#             {"role": "user", "content": prompt},
-#         ],
-#         stream=False,
-#         temperature=0.2,
-#     )
-#     msg = resp.choices[0].message
-#     return getattr(msg, "content", "") or ""
-
-def _call_gemini_for_json(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    TEXT: "{block}"
     """
-    Вызывает Gemini 2.5 Flash и возвращает сырой текст ответа (ожидаем JSON-массив).
-    Включаем жёсткий JSON-режим через response_mime_type, чтобы не ловить «кодфенсы» и прочий мусор.
-    По желанию можно отключить 'thinking' (снизит задержку/стоимость).
-    """
+
+    system_instruction = f"You are an editing assistant. Follow these CUSTOM INSTRUCTIONS strictly: {context}"
+
     response = client.models.generate_content(
-        model=model,
+        model=DEFAULT_MODEL,
         contents=prompt,
+        system_instruction=system_instruction,
         config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=128),
             response_mime_type="application/json",
-            # thinking_config=types.ThinkingConfig(thinking_budget=0),  # раскомментируйте, если хотите быстрее/дешевле
         ),
     )
-    # .text уже приведён к строке; при response_mime_type="application/json" это валидный JSON (строка)
-    return response.text or ""
 
+    return json.loads(response.text)
 
-def _extract_json_array(text: str) -> Any:
-    """
-    Модель иногда оборачивает ответ в тексты/кодфенсы.
-    Пытаемся достать первый JSON-массив безопасно.
-    """
-    # Сначала убираем ```json ... ```
-    fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, flags=re.S)
-    if fenced:
-        text = fenced.group(1)
-
-    # Если в чистом виде массив — отлично
-    text = text.strip()
-    if text.startswith("[") and text.endswith("]"):
-        return json.loads(text)
-
-    # Попробуем найти первый массив в тексте
-    match = re.search(r"\[.*\]", text, flags=re.S)
-    if match:
-        return json.loads(match.group(0))
-
-    # Иногда вернется объект; допустим и его
-    if text.startswith("{") and text.endswith("}"):
-        data = json.loads(text)
-        if isinstance(data, dict):
-            return [data]
-
-    # Если ничего не вышло — бросим исключение
-    raise ValueError("Model did not return a valid JSON array")
-
-
-def _group_and_filter(data: List[Dict[str, Any]], threshold: int = IMPORTANCE_THRESHOLD) -> List[Dict[str, str]]:
-    """
-    Группируем подряд идущие элементы с одинаковым 'suggestion' (логика «слияния/разбиения»),
-    оставляем только группы, где есть хотя бы один элемент с importance >= threshold.
-    На выход — список {original, suggestion} (importance удаляем).
-    """
-    # Нормализация ключей и типов
-    norm = []
-    for d in data:
-        if not isinstance(d, dict):
-            continue
-        original = str(d.get("original", "")).strip()
-        suggestion = str(d.get("suggestion", "")).strip()
-        try:
-            importance = float(d.get("importance", 0))
-        except Exception:
-            importance = 0.0
-        if original and suggestion:
-            norm.append({"original": original, "suggestion": suggestion, "importance": importance})
-
-    kept: List[Dict[str, Any]] = []
-    run: List[Dict[str, Any]] = []
-
-    for d in norm:
-        if not run or d["suggestion"] == run[-1]["suggestion"]:
-            run.append(d)
-        else:
-            if any(x["importance"] >= threshold for x in run):
-                kept.extend(run)
-            run = [d]
-
-    if run and any(x["importance"] >= threshold for x in run):
-        kept.extend(run)
-
-    return [{"original": x["original"], "suggestion": x["suggestion"]} for x in kept]
-
-
-def get_suggestions(full_text: str, context: str = "", model: str = DEFAULT_MODEL) -> List[Dict[str, str]]:
-    """
-    Главная функция: применяет «хвостовой» блок, строит промпт, вызывает DeepSeek,
-    парсит JSON, группирует и фильтрует по важности.
-    """
-    block = _pick_tail_block(full_text)
-    if not block:
-        return []
-
-    prompt = _build_prompt(block, context=context)
-    raw = _call_gemini_for_json(prompt, model=model)
-
-    try:
-        data = _extract_json_array(raw)
-    except Exception as e:
-        # Если JSON не распарсили — пустой список, чтобы не падать сервером
-        print(f"JSON parse error: {e}\nRaw:\n{raw[:1000]}", file=sys.stderr)
-        return []
-
-    try:
-        return _group_and_filter(data, threshold=IMPORTANCE_THRESHOLD)
-    except Exception as e:
-        print(f"Filter/group error: {e}", file=sys.stderr)
-        return []
-    
 def get_highlighted_suggestion(
     selected_text: str,
     text: Optional[str] = None,
@@ -312,7 +190,7 @@ def main_text_proccessing():
     print(f"\n=== RECEIVED MAIN ===\nFrom: {url}\nLen: {len(text)} chars\n==========================\n")
 
     try:
-        suggestions = get_suggestions(text, context=context, model=DEFAULT_MODEL)
+        suggestions = get_suggestions(text, context=context)
 
         # Печать в консоль для отладки
         print("=== SUGGESTIONS ===")
@@ -323,7 +201,7 @@ def main_text_proccessing():
         return jsonify(ok=True, suggestions=suggestions, model=DEFAULT_MODEL)
 
     except Exception as e:
-        print(f"DeepSeek error: {e}", file=sys.stderr)
+        print(f"Gemini error: {e}", file=sys.stderr)
         return jsonify(ok=False, error=str(e)), 500
     
 @app.route("/global_context", methods=["POST", "OPTIONS"])
