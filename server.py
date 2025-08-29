@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import os, sys, json, re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 
 # Gemini (Google Gen AI SDK)
 from google import genai
@@ -207,6 +207,80 @@ def get_suggestions(full_text: str, context: str = "", model: str = DEFAULT_MODE
     except Exception as e:
         print(f"Filter/group error: {e}", file=sys.stderr)
         return []
+    
+def get_highlighted_suggestion(
+    selected_text: str,
+    text: Optional[str] = None,
+    context: str = "",
+    global_context: str = "",
+    *,
+    client,
+    model: str
+) -> Tuple[str, str]:
+    """
+    Returns (suggestion_text, marked_excerpt).
+    """
+    if not text:
+        text = selected_text
+
+    def _sentence_spans(t: str):
+        return [m.span() for m in re.finditer(r'[^.?!]+(?:[.?!]|$)', t, flags=re.MULTILINE)]
+
+    sel_start = text.find(selected_text) if selected_text else -1
+    sel_end = sel_start + len(selected_text) if sel_start != -1 else -1
+
+    if sel_start == -1 and selected_text:
+        relaxed = re.escape(" ".join(selected_text.split())).replace(r"\ ", r"\s+")
+        m = re.search(relaxed, text, flags=re.MULTILINE)
+        if m:
+            sel_start, sel_end = m.span()
+        else:
+            return "Selected text not found in the main text", ""
+
+    spans = _sentence_spans(text)
+    if not spans:
+        return "", ""
+
+    first_idx = None
+    last_idx = None
+    for i, (s, e) in enumerate(spans):
+        if e > sel_start and first_idx is None:
+            first_idx = i
+        if s < sel_end:
+            last_idx = i
+    if first_idx is None:
+        first_idx = last_idx = 0
+
+    left_idx = max(0, first_idx - 1) if first_idx > 0 else first_idx
+    right_idx = min(len(spans) - 1, (last_idx if last_idx is not None else first_idx) + 1)
+    excerpt_start = spans[left_idx][0]
+    excerpt_end = spans[right_idx][1]
+    excerpt = text[excerpt_start:excerpt_end]
+    rel_start = max(0, sel_start - excerpt_start)
+    rel_end = max(rel_start, sel_end - excerpt_start)
+    marked_excerpt = excerpt[:rel_start] + "-->" + excerpt[rel_start:rel_end] + "<--" + excerpt[rel_end:]
+
+    prompt = f"""
+        Improve ONLY the text between --> and <-- so it is concise, clear, and impactful, 
+        while preserving all necessary information and matching the surrounding style and tense.
+        Do not rewrite anything outside the markers.
+        Return ONLY the improved text as plain text.
+
+        {global_context}
+        {context}
+        
+        Text: {marked_excerpt}"""
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="text/plain",
+            thinking_config=types.ThinkingConfig(thinking_budget=128),
+        ),
+    )
+
+    return getattr(response, "text", None), marked_excerpt
 
 
 # --------------------- HTTP СЛОЙ ---------------------
@@ -278,17 +352,31 @@ def context_proccessing():
 
 
 @app.route("/highlight", methods=["GET", "OPTIONS"])
-def watch_config():
+def highlighted_text_proccessing():
     if request.method == "OPTIONS":
         return ("", 204)
-    # Теперь возвращаем СПИСКИ; клиент может интерпретировать их как набор правил
-    return jsonify(
-        ok=True,
-        text_to_change=text_to_change,   # список шаблонов/фраз для поиска
-        suggested_text=suggested_text,   # список соответствующих предложений/замен
-        match="contains",                # "contains" или "equals"
-        poll_ms=5000
-    )
+
+    selected_text = (request.args.get("selected_text") or "").strip()
+    text = request.args.get("text")
+    context = (request.args.get("context") or "").strip()
+    gc_override = request.args.get("global_context")
+    gc = (gc_override if gc_override is not None else global_context) or ""
+
+    if not selected_text:
+        return jsonify(ok=False, error="Query param 'selected_text' is required"), 400
+
+    try:
+        suggestion, marked_excerpt = get_highlighted_suggestion(
+            selected_text=selected_text,
+            text=text,
+            context=context,
+            global_context=gc,
+            client=client,
+            model=DEFAULT_MODEL,
+        )
+        return jsonify(ok=True, suggestion=suggestion or "", marked_excerpt=marked_excerpt or "", model=DEFAULT_MODEL)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 
 if __name__ == "__main__":
