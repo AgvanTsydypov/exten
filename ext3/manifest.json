@@ -13,7 +13,18 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": [
+        "content/constants.js",
+        "content/utils.js",
+        "content/storage.js",
+        "content/api.js",
+        "content/popups.js",
+        "content/tooltip.js",
+        "content/selectPopup.js",
+        "content/globalModal.js",
+        "content/overlay.js",
+        "content/main.js"
+      ],
       "run_at": "document_idle"
     }
   ]
